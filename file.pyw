@@ -1909,6 +1909,133 @@ def handle_download(action):
 
 
 # ==================================================
+# FILE RECEIVE (DASHBOARD DOWNLOADER)
+# ==================================================
+
+def upload_relative_path(raw):
+
+    text = str(raw or "").replace("\\", "/")
+
+    parts = []
+
+    for part in text.split("/"):
+
+        if part in ("", "."):
+            continue
+
+        if part == ".." or ":" in part:
+            return None
+
+        parts.append(part)
+
+    return "/".join(parts) or None
+
+
+def remote_admin_folder():
+
+    base = (
+        os.environ.get("LOCALAPPDATA")
+        or os.path.expanduser("~")
+    )
+
+    return os.path.join(base, "RemoteAdmin")
+
+
+def handle_receive_files(action):
+
+    transfer_id = action.get("transfer_id")
+    items = action.get("files") or []
+
+    if not transfer_id or not items:
+        return
+
+    target_root = remote_admin_folder()
+
+    saved = 0
+    errors = []
+
+    print(
+        "[RECEIVE] Incoming transfer:",
+        len(items),
+        "file(s)",
+        flush=True
+    )
+
+    for item in items:
+
+        relative = upload_relative_path(item.get("path"))
+        url = item.get("url")
+
+        if not relative or not url:
+            errors.append("invalid file entry")
+            continue
+
+        try:
+
+            response = session.get(
+                WEBSITE + url,
+                timeout=120
+            )
+
+            response.raise_for_status()
+
+            destination = os.path.join(
+                target_root,
+                *relative.split("/")
+            )
+
+            os.makedirs(
+                os.path.dirname(destination),
+                exist_ok=True
+            )
+
+            with open(destination, "wb") as handle:
+                handle.write(response.content)
+
+            saved += 1
+
+        except Exception as error:
+
+            errors.append(str(error)[:120])
+
+    message = "" if saved == len(items) else (
+        "; ".join(errors)[:300]
+        or "Some files were not saved."
+    )
+
+    try:
+
+        session.post(
+            WEBSITE + "/api/downloader/complete",
+            json={
+                "transfer_id": transfer_id,
+                "name": identity["name"],
+                "success": saved == len(items),
+                "message": message
+            },
+            timeout=20
+        ).raise_for_status()
+
+    except requests.RequestException as error:
+
+        print(
+            "[RECEIVE] Could not report the result:",
+            error,
+            flush=True
+        )
+
+    print(
+        "[RECEIVE] Saved",
+        saved,
+        "of",
+        len(items),
+        "file(s) to",
+        target_root,
+        flush=True
+    )
+
+
+# ==================================================
 # SERVER ACTIONS
 # ==================================================
 
@@ -1926,6 +2053,14 @@ def handle_action(action):
     elif action_type == "download":
 
         handle_download(action)
+
+    elif action_type == "receive_files":
+
+        threading.Thread(
+            target=handle_receive_files,
+            args=(action,),
+            daemon=True
+        ).start()
 
     elif action_type == "list_dir":
 
