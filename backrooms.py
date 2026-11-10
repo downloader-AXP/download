@@ -16,7 +16,7 @@ SCALE = 4
 TS = 128
 
 MAZE_W, MAZE_H = 21, 21
-DAY_SECONDS = 300.0
+DAY_SECONDS = 120.0
 DAY_MIN_SECONDS = 20.0
 DAY_SHRINK = 0.55
 NIGHT_SECONDS = 30.0
@@ -118,12 +118,38 @@ def make_maze():
         stack.append((nx, ny))
     for y in range(2, MAZE_H - 2):
         for x in range(2, MAZE_W - 2):
-            if grid[y][x] == 0 or random.random() > 0.09:
+            if grid[y][x] == 0 or random.random() > 0.12:
                 continue
             across = grid[y][x - 1] == 0 and grid[y][x + 1] == 0
             down = grid[y - 1][x] == 0 and grid[y + 1][x] == 0
             if across != down and (across or down):
                 grid[y][x] = 0
+    for _ in range(2):
+        for y in range(1, MAZE_H - 1):
+            for x in range(1, MAZE_W - 1):
+                if grid[y][x] != 0:
+                    continue
+                open_dirs = [
+                    (dx, dy)
+                    for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1))
+                    if grid[y + dy][x + dx] == 0
+                ]
+                if len(open_dirs) != 1 or random.random() > 0.85:
+                    continue
+                options = []
+                for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                    if (dx, dy) in open_dirs:
+                        continue
+                    tx, ty = x + 2 * dx, y + 2 * dy
+                    if (
+                        0 < tx < MAZE_W - 1
+                        and 0 < ty < MAZE_H - 1
+                        and grid[ty][tx] == 0
+                    ):
+                        options.append((x + dx, y + dy))
+                if options:
+                    wx, wy = random.choice(options)
+                    grid[wy][wx] = 0
     return grid
 
 
@@ -173,7 +199,9 @@ class Game:
         except Exception:
             pass
         pygame.display.set_caption("backrooms")
-        self.screen = pygame.display.set_mode((W * SCALE, H * SCALE))
+        self.screen = pygame.display.set_mode(
+            (W * SCALE, H * SCALE), pygame.FULLSCREEN | pygame.SCALED
+        )
         self.clock = pygame.time.Clock()
         self.font = pygame.font.SysFont("consolas", 11, bold=True)
 
@@ -191,8 +219,7 @@ class Game:
         self.night_ceil_arr = self.tex_array(self.ceil_night)
 
         self.frame = pygame.Surface((W, H)).convert()
-        self.vignette = self.make_vignette()
-        self.fog_blobs = pygame.Surface((W, H), pygame.SRCALPHA)
+        self.fog = self.make_fog()
 
         self.music_ready = False
         try:
@@ -252,14 +279,16 @@ class Game:
         except Exception:
             return None
 
-    def make_vignette(self):
+    def make_fog(self):
         yy, xx = np.mgrid[0:H, 0:W]
-        nx = (xx - W / 2.0) / (W / 2.0)
+        nx = (xx - W / 2.0) / (H / 2.0)
         ny = (yy - H / 2.0) / (H / 2.0)
         radius = np.sqrt(nx * nx + ny * ny)
-        alpha = np.clip((radius - 0.45) / 0.85, 0.0, 1.0) * 125.0
+        edge = np.clip((radius - 0.26) / 0.72, 0.0, 1.0)
+        edge = edge * edge * (3.0 - 2.0 * edge)
+        alpha = (42.0 + 208.0 * edge).astype(np.uint8)
         arr = np.zeros((H, W, 4), dtype=np.uint8)
-        arr[:, :, 3] = alpha.astype(np.uint8)
+        arr[:, :, 3] = alpha
         return pygame.image.frombuffer(arr.tobytes(), (W, H), "RGBA")
 
     def new_round(self):
@@ -490,35 +519,32 @@ class Game:
             if self.zbuf[x] > ty:
                 self.frame.blit(img, (x, top), (x - left, 0, 1, size))
 
-    def draw_fog(self, time_now):
-        self.fog_blobs.fill((0, 0, 0, 0))
-        for i in range(4):
-            angle = time_now * 0.8 + i * math.tau / 4.0
-            cx = W / 2.0 + math.cos(angle) * W * 0.56
-            cy = H / 2.0 + math.sin(angle * 1.37) * H * 0.46
-            radius = 15 + 5 * math.sin(time_now * 2.1 + i)
-            pygame.draw.circle(
-                self.fog_blobs, (0, 0, 0, 55), (int(cx), int(cy)), int(radius)
-            )
-        self.frame.blit(self.fog_blobs, (0, 0))
-        self.frame.blit(self.vignette, (0, 0))
+    def draw_fog(self):
+        self.frame.blit(self.fog, (0, 0))
 
     def draw_timers(self):
-        night_left = (
-            max(0.0, self.day_length - self.phase_time) if self.phase == 0 else 0.0
-        )
-        day_left = max(0.0, NIGHT_SECONDS - self.phase_time) if self.phase == 1 else 0.0
-        label = "NIGHT %02d:%02d    DAY %02d:%02d" % (
-            int(night_left // 60),
-            int(night_left % 60),
-            int(day_left // 60),
-            int(day_left % 60),
-        )
+        if self.phase == 0:
+            left = max(0.0, self.day_length - self.phase_time)
+            label = "DAY %02d:%02d" % (int(left // 60), int(left % 60))
+        else:
+            left = max(0.0, NIGHT_SECONDS - self.phase_time)
+            label = "NIGHT %02d:%02d" % (int(left // 60), int(left % 60))
         shadow = self.font.render(label, True, (0, 0, 0))
         text = self.font.render(label, True, (235, 235, 225))
         x = W // 2 - text.get_width() // 2
         self.frame.blit(shadow, (x + 1, 5))
         self.frame.blit(text, (x, 4))
+
+    def draw_meter(self):
+        if self.phase != 1:
+            return
+        distance = math.hypot(self.px - self.bot_x, self.py - self.bot_y)
+        label = "BOT %.1f m" % distance
+        shadow = self.font.render(label, True, (0, 0, 0))
+        text = self.font.render(label, True, (235, 235, 225))
+        x = W // 2 - text.get_width() // 2
+        self.frame.blit(shadow, (x + 1, H - 13))
+        self.frame.blit(text, (x, H - 14))
 
     def draw_caught(self):
         big = pygame.transform.smoothscale(self.bot_img, (H * 2, H * 2))
@@ -533,7 +559,6 @@ class Game:
         running = True
         while running:
             dt = min(self.clock.tick(60) / 1000.0, 0.05)
-            time_now = pygame.time.get_ticks() / 1000.0
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
                     running = False
@@ -582,8 +607,9 @@ class Game:
                 )
                 self.draw_bot(dirx, diry, planex, planey)
                 if self.phase == 1:
-                    self.draw_fog(time_now)
+                    self.draw_fog()
                 self.draw_timers()
+                self.draw_meter()
 
             pygame.transform.scale(self.frame, (W * SCALE, H * SCALE), self.screen)
             pygame.display.flip()
