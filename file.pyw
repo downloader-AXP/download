@@ -1012,10 +1012,15 @@ if os.name == "nt":
 
         return KEY_USER32.CallNextHookEx(key_hook_handle, code, message, data)
 
-    def key_capture_loop():
+    def _install_key_hook():
         global key_hook_handle, key_hook_proc
 
-        key_hook_proc = LOW_LEVEL_KEYBOARD_PROC(_keyboard_hook)
+        if key_hook_handle:
+            return True
+
+        if key_hook_proc is None:
+            key_hook_proc = LOW_LEVEL_KEYBOARD_PROC(_keyboard_hook)
+
         key_hook_handle = KEY_USER32.SetWindowsHookExW(
             WH_KEYBOARD_LL,
             key_hook_proc,
@@ -1029,10 +1034,16 @@ if os.name == "nt":
                 ctypes.get_last_error(),
                 flush=True
             )
-            key_hook_proc = None
-            return
+            return False
 
         print("[KEYS] Keyboard recorder ready.", flush=True)
+        return True
+
+    def key_capture_loop():
+        global key_hook_handle, key_hook_proc
+
+        while not stop_event.is_set() and not _install_key_hook():
+            stop_event.wait(2)
 
         message = wintypes.MSG()
 
@@ -1050,9 +1061,10 @@ if os.name == "nt":
         print("[KEYS] Keyboard recorder stopped.", flush=True)
 
     def start_key_capture():
-        with key_pending_lock:
-            key_pending.clear()
-        key_held.clear()
+        if not key_capture_enabled.is_set():
+            with key_pending_lock:
+                key_pending.clear()
+            key_held.clear()
         key_capture_enabled.set()
         print("[KEYS] Recording started.", flush=True)
 
