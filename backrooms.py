@@ -17,14 +17,17 @@ TS = 128
 
 MAZE_W, MAZE_H = 21, 21
 DAY_SECONDS = 120.0
-DAY_MIN_SECONDS = 20.0
-DAY_SHRINK = 0.55
+DAY_STEP = 40.0
 NIGHT_SECONDS = 30.0
 PLAYER_SPEED = 2.3
+BOT_SPEED = PLAYER_SPEED
 TURN_SPEED = 2.2
-BOT_SPEED = 1.55
 LIGHT_RANGE = 4.6
+SPRINT_TIME = 5.0
+SPRINT_COOLDOWN = 20.0
+SPRINT_MULT = 1.18
 WALL_LEVELS = 24
+BLOOD_TINT = np.array([1.0, 0.78, 0.78])
 
 WALL = "png1.png"
 FLOOR_DAY = "png2.png"
@@ -206,16 +209,24 @@ class Game:
         )
         self.clock = pygame.time.Clock()
         self.font = pygame.font.SysFont("consolas", 11, bold=True)
+        self.mid_font = pygame.font.SysFont("consolas", 15, bold=True)
+        self.big_font = pygame.font.SysFont("consolas", 26, bold=True)
 
         self.wall = load_texture(WALL, (150, 136, 84))
         self.wall_night_levels = self.shade_ladder(
             self.tint(self.wall, (158, 162, 178))
+        )
+        self.wall_blood_levels = self.shade_ladder(
+            self.tint(self.wall, (255, 150, 150))
         )
         self.floor_day = load_texture(FLOOR_DAY, (120, 110, 78))
         self.floor_night = load_texture(FLOOR_NIGHT, (34, 30, 28))
         self.ceil_day = load_texture(CEIL_DAY, (150, 148, 138))
         self.ceil_night = load_texture(CEIL_NIGHT, (20, 19, 22))
         self.bot_images = [load_bot(n, i) for i, n in enumerate(BOTS)]
+        self.aura_img = self.make_aura()
+        self.blood_fog = pygame.Surface((W, H), pygame.SRCALPHA)
+        self.blood_fog.fill((130, 6, 6, 24))
 
         self.day_floor_arr = self.tex_array(self.floor_day)
         self.night_floor_arr = self.tex_array(self.floor_night)
@@ -242,11 +253,30 @@ class Game:
         self.step_sound = self.make_step_sound()
         self.caught = 0.0
         self.bot_img = self.bot_images[0]
+        self.flashlight = False
+        self.sprint_time = 0.0
+        self.sprint_cd = 0.0
+        self.final_night = False
+        self.final_banner = 0.0
+        self.state = "menu"
+        self.mouse = (0, 0)
         self.new_round()
 
     @staticmethod
     def tex_array(surf):
         return np.asarray(pygame.surfarray.array3d(surf)).transpose(1, 0, 2)
+
+    @staticmethod
+    def make_aura(size=128):
+        surf = pygame.Surface((size, size), pygame.SRCALPHA)
+        yy, xx = np.mgrid[0:size, 0:size]
+        radius = size / 2.0
+        dist = np.hypot(xx - radius, yy - radius) / radius
+        alpha = (np.clip(1.0 - dist, 0.0, 1.0) ** 2 * 175).astype(np.uint8)
+        pixels = pygame.surfarray.pixels_alpha(surf)
+        pixels[:] = alpha.T
+        del pixels
+        return surf
 
     @staticmethod
     def tint(surf, color):
@@ -308,6 +338,10 @@ class Game:
         self.caught = 0.0
         self.day_length = DAY_SECONDS
         self.step_timer = 0.0
+        self.sprint_time = 0.0
+        self.sprint_cd = 0.0
+        self.final_night = False
+        self.final_banner = 0.0
         self.set_phase(0)
         self.stop_music()
 
@@ -380,13 +414,32 @@ class Game:
             strafe /= length
             fx = math.cos(self.angle)
             fy = math.sin(self.angle)
-            dx = (fx * forward - fy * strafe) * PLAYER_SPEED * dt
-            dy = (fy * forward + fx * strafe) * PLAYER_SPEED * dt
+            speed = PLAYER_SPEED * (SPRINT_MULT if self.sprint_time > 0.0 else 1.0)
+            dx = (fx * forward - fy * strafe) * speed * dt
+            dy = (fy * forward + fx * strafe) * speed * dt
             if not self.blocked(self.px + dx, self.py):
                 self.px += dx
             if not self.blocked(self.px, self.py + dy):
                 self.py += dy
         return moving
+
+    def start_sprint(self):
+        if self.caught > 0.0 or self.sprint_time > 0.0 or self.sprint_cd > 0.0:
+            return
+        self.sprint_time = SPRINT_TIME
+
+    def update_sprint(self, dt):
+        if self.sprint_time > 0.0:
+            self.sprint_time = max(0.0, self.sprint_time - dt)
+            if self.sprint_time <= 0.0:
+                self.sprint_cd = SPRINT_COOLDOWN
+        elif self.sprint_cd > 0.0:
+            self.sprint_cd = max(0.0, self.sprint_cd - dt)
+
+    def begin_final_night(self):
+        self.final_night = True
+        self.final_banner = 4.5
+        self.set_phase(1)
 
     def update_bot(self, dt):
         if self.phase != 1 or self.caught > 0.0:
@@ -462,7 +515,10 @@ class Game:
             top = H // 2 - line_h // 2
             if self.phase == 1:
                 level = int(self.light(perp) * (WALL_LEVELS - 1) + 0.5)
-                tex = self.wall_night_levels[level]
+                ladder = (
+                    self.wall_blood_levels if self.final_night else self.wall_night_levels
+                )
+                tex = ladder[level]
             else:
                 tex = self.wall
             if side == 0:
@@ -500,7 +556,10 @@ class Game:
         arr[half + 1:] = floor_tex[ty[half + 1:], tx[half + 1:]]
         if self.phase == 1:
             fade = np.clip((1.0 - distance / LIGHT_RANGE) * 1.5, 0.0, 1.0)
-            arr = (arr * fade[:, None, None]).astype(np.uint8)
+            if self.final_night:
+                arr = (arr * (fade[:, None, None] * BLOOD_TINT)).astype(np.uint8)
+            else:
+                arr = (arr * fade[:, None, None]).astype(np.uint8)
         pygame.surfarray.blit_array(self.frame, np.ascontiguousarray(arr.transpose(1, 0, 2)))
 
     def draw_bot(self, dirx, diry, planex, planey):
@@ -524,26 +583,59 @@ class Game:
         if size < 2 or size > H * 6:
             return
         img = pygame.transform.scale(self.bot_img, (size, size))
-        shade = int(self.light(ty) * 255)
+        shade = int(max(self.light(ty), 0.7) * 255)
         if shade < 255:
             img.fill((shade, shade, shade, 255), special_flags=pygame.BLEND_MULT)
+
+        aura_size = min(int(size * 1.7), H * 6)
+        if aura_size > 2:
+            aura = pygame.transform.scale(self.aura_img, (aura_size, aura_size))
+            self.frame.blit(
+                aura, (screen_x - aura_size // 2, top + size // 2 - aura_size // 2)
+            )
+
+        ghost = None
+        if not self.flashlight:
+            ghost = img.copy()
+            ghost.fill((255, 255, 255, 100), special_flags=pygame.BLEND_RGBA_MULT)
         left = screen_x - size // 2
         for x in range(max(0, left), min(W, left + size)):
-            if self.zbuf[x] > ty:
-                self.frame.blit(img, (x, top), (x - left, 0, 1, size))
+            source = img if self.flashlight or self.zbuf[x] > ty else ghost
+            self.frame.blit(source, (x, top), (x - left, 0, 1, size))
 
     def draw_timers(self):
+        color = (235, 235, 225)
         if self.phase == 0:
             left = max(0.0, self.day_length - self.phase_time)
             label = "DAY %02d:%02d" % (int(left // 60), int(left % 60))
         else:
             left = max(0.0, NIGHT_SECONDS - self.phase_time)
-            label = "NIGHT %02d:%02d" % (int(left // 60), int(left % 60))
+            if self.final_night:
+                label = "LAST NIGHT %02d:%02d" % (int(left // 60), int(left % 60))
+                color = (255, 172, 160)
+            else:
+                label = "NIGHT %02d:%02d" % (int(left // 60), int(left % 60))
         shadow = self.font.render(label, True, (0, 0, 0))
-        text = self.font.render(label, True, (235, 235, 225))
+        text = self.font.render(label, True, color)
         x = W // 2 - text.get_width() // 2
         self.frame.blit(shadow, (x + 1, 5))
         self.frame.blit(text, (x, 4))
+
+    def draw_banner(self):
+        if self.final_banner <= 0.0:
+            return
+        lines = (
+            ("DAY 00:00", self.mid_font, (255, 190, 180)),
+            ("THE BLOOD MOON RISES", self.font, (240, 150, 140)),
+        )
+        y = H // 2 - 34
+        for text, font, color in lines:
+            shadow = font.render(text, True, (0, 0, 0))
+            surf = font.render(text, True, color)
+            x = W // 2 - surf.get_width() // 2
+            self.frame.blit(shadow, (x + 1, y + 1))
+            self.frame.blit(surf, (x, y))
+            y += surf.get_height() + 3
 
     def draw_meter(self):
         if self.phase != 1:
@@ -555,6 +647,90 @@ class Game:
         x = W // 2 - text.get_width() // 2
         self.frame.blit(shadow, (x + 1, H - 13))
         self.frame.blit(text, (x, H - 14))
+
+    def draw_skill(self):
+        rect = pygame.Rect(W - 60, H - 34, 54, 28)
+        panel = pygame.Surface(rect.size, pygame.SRCALPHA)
+        panel.fill((8, 8, 10, 190))
+        self.frame.blit(panel, rect.topleft)
+        if self.sprint_time > 0.0:
+            color = (255, 200, 90)
+            status = "%.1fs" % self.sprint_time
+            fill = self.sprint_time / SPRINT_TIME
+        elif self.sprint_cd > 0.0:
+            color = (125, 128, 136)
+            status = "%ds" % math.ceil(self.sprint_cd)
+            fill = 1.0 - self.sprint_cd / SPRINT_COOLDOWN
+        else:
+            color = (120, 235, 150)
+            status = "READY"
+            fill = 1.0
+        pygame.draw.rect(self.frame, color, rect, 1)
+        label = self.font.render("SPRINT", True, (225, 225, 215))
+        self.frame.blit(label, (rect.x + 4, rect.y + 2))
+        text = self.font.render(status, True, color)
+        self.frame.blit(text, (rect.x + 4, rect.y + 13))
+        bar = pygame.Rect(rect.x + 4, rect.bottom - 5, int((rect.width - 8) * fill), 3)
+        if bar.width > 0:
+            pygame.draw.rect(self.frame, color, bar)
+
+    def draw_flashlight(self):
+        label = "F LIGHT " + ("ON" if self.flashlight else "OFF")
+        color = (255, 232, 160) if self.flashlight else (120, 120, 126)
+        shadow = self.font.render(label, True, (0, 0, 0))
+        text = self.font.render(label, True, color)
+        self.frame.blit(shadow, (5, H - 13))
+        self.frame.blit(text, (4, H - 14))
+
+    def play_rect(self):
+        return pygame.Rect(W // 2 - 42, 92, 84, 24)
+
+    def draw_menu(self):
+        self.frame.fill((7, 7, 9))
+        title = self.big_font.render("BACKROOMS", True, (238, 224, 180))
+        self.frame.blit(title, (W // 2 - title.get_width() // 2, 30))
+        sub = self.font.render("survive the last night", True, (150, 150, 145))
+        self.frame.blit(sub, (W // 2 - sub.get_width() // 2, 68))
+        rect = self.play_rect()
+        hover = rect.collidepoint(self.mouse)
+        pygame.draw.rect(self.frame, (58, 54, 44) if hover else (26, 26, 30), rect)
+        pygame.draw.rect(self.frame, (222, 202, 150), rect, 1)
+        label = self.font.render("PLAY", True, (240, 232, 210))
+        self.frame.blit(
+            label,
+            (rect.centerx - label.get_width() // 2, rect.centery - label.get_height() // 2),
+        )
+        hint = self.font.render("ENTER  START      ESC  QUIT", True, (100, 100, 105))
+        self.frame.blit(hint, (W // 2 - hint.get_width() // 2, H - 18))
+
+    def draw_brief(self):
+        self.frame.fill((7, 7, 9))
+        title = self.mid_font.render("HOW TO SURVIVE", True, (238, 224, 180))
+        self.frame.blit(title, (W // 2 - title.get_width() // 2, 14))
+        lines = (
+            "WASD move   ARROWS / Q E turn",
+            "SHIFT sprint   F flashlight",
+            "Goal: survive the last night.",
+            "When the day timer hits DAY 00:00",
+            "the blood moon rises and the fog",
+            "turns red. Survive that night.",
+        )
+        y = 38
+        for line in lines:
+            surf = self.font.render(line, True, (205, 205, 195))
+            self.frame.blit(surf, (W // 2 - surf.get_width() // 2, y))
+            y += 14
+        hint = self.font.render("ENTER or click to begin", True, (130, 210, 160))
+        self.frame.blit(hint, (W // 2 - hint.get_width() // 2, H - 20))
+
+    def draw_win(self):
+        self.frame.fill((9, 4, 5))
+        title = self.big_font.render("SURVIVED", True, (255, 130, 120))
+        self.frame.blit(title, (W // 2 - title.get_width() // 2, 34))
+        sub = self.font.render("THE BLOOD MOON PASSED", True, (220, 180, 170))
+        self.frame.blit(sub, (W // 2 - sub.get_width() // 2, 74))
+        hint = self.font.render("ENTER  MAIN MENU", True, (150, 150, 145))
+        self.frame.blit(hint, (W // 2 - hint.get_width() // 2, H - 22))
 
     def draw_caught(self):
         big = pygame.transform.smoothscale(self.bot_img, (H * 2, H * 2))
@@ -569,49 +745,98 @@ class Game:
         running = True
         while running:
             dt = min(self.clock.tick(60) / 1000.0, 0.05)
+            pos = pygame.mouse.get_pos()
+            self.mouse = (pos[0] / SCALE, pos[1] / SCALE)
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
                     running = False
-                elif event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
-                    running = False
+                elif event.type == pygame.KEYDOWN:
+                    if event.key == pygame.K_ESCAPE:
+                        running = False
+                    elif event.key == pygame.K_RETURN:
+                        if self.state == "menu":
+                            self.state = "brief"
+                        elif self.state == "brief":
+                            self.new_round()
+                            self.state = "play"
+                        elif self.state == "win":
+                            self.state = "menu"
+                    elif event.key == pygame.K_f and self.state == "play":
+                        self.flashlight = not self.flashlight
+                    elif (
+                        event.key in (pygame.K_LSHIFT, pygame.K_RSHIFT)
+                        and self.state == "play"
+                    ):
+                        self.start_sprint()
+                elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                    mx, my = event.pos[0] / SCALE, event.pos[1] / SCALE
+                    if self.state == "menu" and self.play_rect().collidepoint(mx, my):
+                        self.state = "brief"
+                    elif self.state == "brief":
+                        self.new_round()
+                        self.state = "play"
+                    elif self.state == "win":
+                        self.state = "menu"
 
-            keys = pygame.key.get_pressed()
-            if self.caught > 0.0:
-                self.caught -= dt
-                if self.caught <= 0.0:
-                    self.new_round()
-                    continue
-                self.draw_caught()
+            if self.state == "menu":
+                self.draw_menu()
+            elif self.state == "brief":
+                self.draw_brief()
+            elif self.state == "win":
+                self.draw_win()
             else:
-                moving = self.update_player(dt, keys)
-                if moving:
-                    self.step_timer -= dt
-                    if self.step_timer <= 0.0:
-                        self.step_timer = 0.38 + random.uniform(0.0, 0.08)
-                        if self.step_sound:
-                            self.step_sound.play()
+                keys = pygame.key.get_pressed()
+                if self.caught > 0.0:
+                    self.caught -= dt
+                    if self.caught <= 0.0:
+                        self.new_round()
+                        continue
+                    self.draw_caught()
                 else:
-                    self.step_timer = 0.0
-                self.update_bot(dt)
-                if self.caught <= 0.0:
-                    self.phase_time += dt
-                    if self.phase == 0 and self.phase_time >= self.day_length:
-                        self.set_phase(1)
-                    elif self.phase == 1 and self.phase_time >= NIGHT_SECONDS:
-                        self.day_length = max(
-                            DAY_MIN_SECONDS, self.day_length * DAY_SHRINK
-                        )
-                        self.set_phase(0)
+                    moving = self.update_player(dt, keys)
+                    self.update_sprint(dt)
+                    if moving:
+                        self.step_timer -= dt
+                        if self.step_timer <= 0.0:
+                            self.step_timer = 0.38 + random.uniform(0.0, 0.08)
+                            if self.step_sound:
+                                self.step_sound.play()
+                    else:
+                        self.step_timer = 0.0
+                    self.update_bot(dt)
+                    if self.caught <= 0.0:
+                        self.phase_time += dt
+                        if self.final_banner > 0.0:
+                            self.final_banner -= dt
+                        if self.phase == 0 and self.phase_time >= self.day_length:
+                            self.set_phase(1)
+                        elif self.phase == 1 and self.phase_time >= NIGHT_SECONDS:
+                            if self.final_night:
+                                self.stop_music()
+                                self.state = "win"
+                            else:
+                                self.day_length = max(0.0, self.day_length - DAY_STEP)
+                                if self.day_length <= 0.0:
+                                    self.begin_final_night()
+                                else:
+                                    self.set_phase(0)
 
-                dirx = math.cos(self.angle)
-                diry = math.sin(self.angle)
-                planex = -diry * 0.66
-                planey = dirx * 0.66
-                self.paint_floor_ceiling(dirx, diry, planex, planey)
-                self.cast_walls(dirx, diry, planex, planey)
-                self.draw_bot(dirx, diry, planex, planey)
-                self.draw_timers()
-                self.draw_meter()
+                    if self.state == "play":
+                        dirx = math.cos(self.angle)
+                        diry = math.sin(self.angle)
+                        planex = -diry * 0.66
+                        planey = dirx * 0.66
+                        self.paint_floor_ceiling(dirx, diry, planex, planey)
+                        if not self.flashlight:
+                            self.cast_walls(dirx, diry, planex, planey)
+                        self.draw_bot(dirx, diry, planex, planey)
+                        if self.final_night:
+                            self.frame.blit(self.blood_fog, (0, 0))
+                        self.draw_timers()
+                        self.draw_banner()
+                        self.draw_meter()
+                        self.draw_skill()
+                        self.draw_flashlight()
 
             pygame.transform.scale(self.frame, (W * SCALE, H * SCALE), self.screen)
             pygame.display.flip()
