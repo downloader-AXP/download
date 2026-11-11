@@ -1,4 +1,4 @@
-"""backrooms.py - a small raycast maze that does not try very hard."""
+
 
 import math
 import os
@@ -19,8 +19,8 @@ MAZE_W, MAZE_H = 21, 21
 DAY_SECONDS = 120.0
 DAY_STEP = 40.0
 NIGHT_SECONDS = 30.0
-PLAYER_SPEED = 2.3
-BOT_SPEED = 1.55
+PLAYER_SPEED = 2.5
+BOT_SPEED = 2
 TURN_SPEED = 2.2
 LIGHT_RANGE = 2.4
 LIGHT_FALLOFF = 1.2
@@ -250,6 +250,7 @@ class Game:
         self.day_length = DAY_SECONDS
         self.step_timer = 0.0
         self.step_sound = self.make_step_sound()
+        self.click_sound = self.make_click_sound()
         self.caught = 0.0
         self.bot_img = self.bot_images[0]
         self.final_night = False
@@ -313,6 +314,25 @@ class Game:
             offset = int(rate * delay)
             samples[offset:offset + count] += burst * gain
         samples = np.clip(samples, -1.0, 1.0) * 0.55
+        try:
+            return pygame.mixer.Sound(
+                buffer=(samples * 32767).astype(np.int16).tobytes()
+            )
+        except Exception:
+            return None
+
+    def make_click_sound(self):
+        if not pygame.mixer.get_init():
+            return None
+        rate = 22050
+        count = int(rate * 0.07)
+        t = np.arange(count) / rate
+        burst = (
+            0.6 * np.sin(2 * np.pi * 1180.0 * t)
+            + 0.3 * np.sin(2 * np.pi * 1760.0 * t)
+            + 0.2 * np.random.uniform(-1.0, 1.0, count)
+        ) * np.exp(-t * 95.0)
+        samples = np.clip(burst, -1.0, 1.0) * 0.4
         try:
             return pygame.mixer.Sound(
                 buffer=(samples * 32767).astype(np.int16).tobytes()
@@ -689,6 +709,8 @@ class Game:
                         running = False
                     elif event.key == pygame.K_RETURN:
                         if self.state == "menu":
+                            if self.click_sound:
+                                self.click_sound.play()
                             self.new_round()
                             self.state = "play"
                         elif self.state == "win":
@@ -696,6 +718,8 @@ class Game:
                 elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
                     mx, my = event.pos[0] / SCALE, event.pos[1] / SCALE
                     if self.state == "menu" and self.play_rect().collidepoint(mx, my):
+                        if self.click_sound:
+                            self.click_sound.play()
                         self.new_round()
                         self.state = "play"
                     elif self.state == "win":
@@ -746,7 +770,7 @@ class Game:
                         diry = math.sin(self.angle)
                         planex = -diry * 0.66
                         planey = dirx * 0.66
-                        self.paint_floor_ceiling(dirx, diry, planex, planey)
+                        self.paint_floor_ceiling(dirx, diry, planex, planey)	
                         self.cast_walls(dirx, diry, planex, planey)
                         self.draw_bot(dirx, diry, planex, planey)
                         if self.final_night:
