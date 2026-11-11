@@ -1,4 +1,4 @@
-
+"""backrooms.py - a small raycast maze that does not try very hard."""
 
 import math
 import os
@@ -22,12 +22,9 @@ NIGHT_SECONDS = 30.0
 PLAYER_SPEED = 2.3
 BOT_SPEED = 1.55
 TURN_SPEED = 2.2
-LIGHT_RANGE = 3.2
-LIGHT_FALLOFF = 1.35
-FLASH_RANGE = 9.5
-SPRINT_TIME = 5.0
-SPRINT_COOLDOWN = 20.0
-SPRINT_MULT = 1.18
+LIGHT_RANGE = 2.4
+LIGHT_FALLOFF = 1.2
+BEAM_RANGE = 7.0
 WALL_LEVELS = 24
 BLOOD_TINT = np.array([1.0, 0.78, 0.78])
 
@@ -255,9 +252,6 @@ class Game:
         self.step_sound = self.make_step_sound()
         self.caught = 0.0
         self.bot_img = self.bot_images[0]
-        self.flashlight = False
-        self.sprint_time = 0.0
-        self.sprint_cd = 0.0
         self.final_night = False
         self.final_banner = 0.0
         self.state = "menu"
@@ -340,8 +334,6 @@ class Game:
         self.caught = 0.0
         self.day_length = DAY_SECONDS
         self.step_timer = 0.0
-        self.sprint_time = 0.0
-        self.sprint_cd = 0.0
         self.final_night = False
         self.final_banner = 0.0
         self.set_phase(0)
@@ -416,27 +408,13 @@ class Game:
             strafe /= length
             fx = math.cos(self.angle)
             fy = math.sin(self.angle)
-            speed = PLAYER_SPEED * (SPRINT_MULT if self.sprint_time > 0.0 else 1.0)
-            dx = (fx * forward - fy * strafe) * speed * dt
-            dy = (fy * forward + fx * strafe) * speed * dt
+            dx = (fx * forward - fy * strafe) * PLAYER_SPEED * dt
+            dy = (fy * forward + fx * strafe) * PLAYER_SPEED * dt
             if not self.blocked(self.px + dx, self.py):
                 self.px += dx
             if not self.blocked(self.px, self.py + dy):
                 self.py += dy
         return moving
-
-    def start_sprint(self):
-        if self.caught > 0.0 or self.sprint_time > 0.0 or self.sprint_cd > 0.0:
-            return
-        self.sprint_time = SPRINT_TIME
-
-    def update_sprint(self, dt):
-        if self.sprint_time > 0.0:
-            self.sprint_time = max(0.0, self.sprint_time - dt)
-            if self.sprint_time <= 0.0:
-                self.sprint_cd = SPRINT_COOLDOWN
-        elif self.sprint_cd > 0.0:
-            self.sprint_cd = max(0.0, self.sprint_cd - dt)
 
     def begin_final_night(self):
         self.final_night = True
@@ -516,11 +494,9 @@ class Game:
             line_h = int(H / perp)
             top = H // 2 - line_h // 2
             if self.phase == 1:
-                brightness = self.light(perp)
-                if self.flashlight:
-                    cone = max(0.0, 1.0 - abs(camera) * 1.35)
-                    beam = max(0.0, 1.0 - perp / FLASH_RANGE) * cone
-                    brightness = min(1.0, max(brightness, beam))
+                cone = max(0.0, 1.0 - abs(camera) * 1.35)
+                beam = max(0.0, 1.0 - perp / BEAM_RANGE) * cone
+                brightness = min(1.0, max(self.light(perp), beam))
                 level = int(brightness * (WALL_LEVELS - 1) + 0.5)
                 ladder = (
                     self.wall_blood_levels if self.final_night else self.wall_night_levels
@@ -565,13 +541,12 @@ class Game:
             fade = np.clip(
                 (1.0 - distance / LIGHT_RANGE) * LIGHT_FALLOFF, 0.0, 1.0
             )[:, None]
-            if self.flashlight:
-                cone = np.clip(1.0 - np.abs(xs) * 1.35, 0.0, 1.0)
-                beam = (
-                    np.clip(1.0 - distance[:, None] / FLASH_RANGE, 0.0, 1.0)
-                    * cone[None, :]
-                )
-                fade = np.maximum(fade, beam)
+            cone = np.clip(1.0 - np.abs(xs) * 1.35, 0.0, 1.0)
+            beam = (
+                np.clip(1.0 - distance[:, None] / BEAM_RANGE, 0.0, 1.0)
+                * cone[None, :]
+            )
+            fade = np.maximum(fade, beam)
             if self.final_night:
                 arr = (arr * (fade[:, :, None] * BLOOD_TINT)).astype(np.uint8)
             else:
@@ -599,11 +574,9 @@ class Game:
         if size < 2 or size > H * 6:
             return
         img = pygame.transform.scale(self.bot_img, (size, size))
-        brightness = self.light(ty)
-        if self.flashlight:
-            cone = max(0.0, 1.0 - abs(tx / ty) * 1.35)
-            beam = max(0.0, 1.0 - ty / FLASH_RANGE) * cone
-            brightness = max(brightness, beam)
+        cone = max(0.0, 1.0 - abs(tx / ty) * 1.35)
+        beam = max(0.0, 1.0 - ty / BEAM_RANGE) * cone
+        brightness = max(self.light(ty), beam)
         shade = int(max(brightness, 0.7) * 255)
         if shade < 255:
             img.fill((shade, shade, shade, 255), special_flags=pygame.BLEND_MULT)
@@ -669,61 +642,11 @@ class Game:
         self.frame.blit(shadow, (x + 1, H - 13))
         self.frame.blit(text, (x, H - 14))
 
-    def draw_sprint_icon(self):
-        if self.sprint_time > 0.0:
-            color = (255, 200, 90)
-            fill = self.sprint_time / SPRINT_TIME
-        elif self.sprint_cd > 0.0:
-            color = (88, 91, 99)
-            fill = 1.0 - self.sprint_cd / SPRINT_COOLDOWN
-        else:
-            color = (120, 235, 150)
-            fill = 1.0
-        base_x = W - 26
-        base_y = H - 27
-        for i in range(3):
-            cx = base_x + i * 7
-            pygame.draw.rect(self.frame, color, (cx + 1, base_y + 7, 3, 6))
-            pygame.draw.polygon(
-                self.frame,
-                color,
-                [(cx, base_y + 8), (cx + 5, base_y + 8), (cx + 2, base_y + 2)],
-            )
-        bar = pygame.Rect(base_x, H - 9, 21, 2)
-        pygame.draw.rect(self.frame, (45, 47, 53), bar)
-        if fill > 0.0:
-            pygame.draw.rect(
-                self.frame, color, (bar.x, bar.y, int(bar.width * fill), bar.height)
-            )
-
-    def draw_flashlight_icon(self):
-        color = (255, 228, 140) if self.flashlight else (185, 187, 195)
-        pygame.draw.rect(self.frame, (0, 0, 0), (5, 10, 10, 6))
-        pygame.draw.polygon(
-            self.frame, (0, 0, 0), [(15, 7), (20, 5), (20, 17), (15, 15)]
-        )
-        pygame.draw.rect(self.frame, color, (4, 9, 10, 6))
-        pygame.draw.polygon(
-            self.frame, color, [(14, 6), (19, 4), (19, 16), (14, 14)]
-        )
-        lens = (255, 252, 220) if self.flashlight else (55, 57, 64)
-        pygame.draw.rect(self.frame, lens, (19, 6, 2, 10))
-        pygame.draw.rect(self.frame, (30, 30, 34), (6, 7, 3, 2))
-        if self.flashlight:
-            beam = (255, 240, 180)
-            pygame.draw.line(self.frame, beam, (22, 8), (27, 6))
-            pygame.draw.line(self.frame, beam, (22, 10), (28, 10))
-            pygame.draw.line(self.frame, beam, (22, 12), (27, 14))
-
     def play_rect(self):
-        return pygame.Rect(W // 2 - 42, 92, 84, 24)
+        return pygame.Rect(W // 2 - 42, H // 2 - 12, 84, 24)
 
     def draw_menu(self):
         self.frame.fill((7, 7, 9))
-        title = self.big_font.render("BACKROOMS", True, (238, 224, 180))
-        self.frame.blit(title, (W // 2 - title.get_width() // 2, 30))
-        sub = self.font.render("survive the last night", True, (150, 150, 145))
-        self.frame.blit(sub, (W // 2 - sub.get_width() // 2, 68))
         rect = self.play_rect()
         hover = rect.collidepoint(self.mouse)
         pygame.draw.rect(self.frame, (58, 54, 44) if hover else (26, 26, 30), rect)
@@ -733,28 +656,6 @@ class Game:
             label,
             (rect.centerx - label.get_width() // 2, rect.centery - label.get_height() // 2),
         )
-        hint = self.font.render("ENTER  START      ESC  QUIT", True, (100, 100, 105))
-        self.frame.blit(hint, (W // 2 - hint.get_width() // 2, H - 18))
-
-    def draw_brief(self):
-        self.frame.fill((7, 7, 9))
-        title = self.mid_font.render("HOW TO SURVIVE", True, (238, 224, 180))
-        self.frame.blit(title, (W // 2 - title.get_width() // 2, 14))
-        lines = (
-            "WASD move   ARROWS / Q E turn",
-            "SHIFT sprint   F flashlight",
-            "Goal: survive the last night.",
-            "When the day timer hits DAY 00:00",
-            "the blood moon rises and the fog",
-            "turns red. Survive that night.",
-        )
-        y = 38
-        for line in lines:
-            surf = self.font.render(line, True, (205, 205, 195))
-            self.frame.blit(surf, (W // 2 - surf.get_width() // 2, y))
-            y += 14
-        hint = self.font.render("ENTER or click to begin", True, (130, 210, 160))
-        self.frame.blit(hint, (W // 2 - hint.get_width() // 2, H - 20))
 
     def draw_win(self):
         self.frame.fill((9, 4, 5))
@@ -788,24 +689,13 @@ class Game:
                         running = False
                     elif event.key == pygame.K_RETURN:
                         if self.state == "menu":
-                            self.state = "brief"
-                        elif self.state == "brief":
                             self.new_round()
                             self.state = "play"
                         elif self.state == "win":
                             self.state = "menu"
-                    elif event.key == pygame.K_f and self.state == "play":
-                        self.flashlight = not self.flashlight
-                    elif (
-                        event.key in (pygame.K_LSHIFT, pygame.K_RSHIFT)
-                        and self.state == "play"
-                    ):
-                        self.start_sprint()
                 elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
                     mx, my = event.pos[0] / SCALE, event.pos[1] / SCALE
                     if self.state == "menu" and self.play_rect().collidepoint(mx, my):
-                        self.state = "brief"
-                    elif self.state == "brief":
                         self.new_round()
                         self.state = "play"
                     elif self.state == "win":
@@ -813,8 +703,6 @@ class Game:
 
             if self.state == "menu":
                 self.draw_menu()
-            elif self.state == "brief":
-                self.draw_brief()
             elif self.state == "win":
                 self.draw_win()
             else:
@@ -827,7 +715,6 @@ class Game:
                     self.draw_caught()
                 else:
                     moving = self.update_player(dt, keys)
-                    self.update_sprint(dt)
                     if moving:
                         self.step_timer -= dt
                         if self.step_timer <= 0.0:
@@ -867,8 +754,6 @@ class Game:
                         self.draw_timers()
                         self.draw_banner()
                         self.draw_meter()
-                        self.draw_sprint_icon()
-                        self.draw_flashlight_icon()
 
             pygame.transform.scale(self.frame, (W * SCALE, H * SCALE), self.screen)
             pygame.display.flip()
