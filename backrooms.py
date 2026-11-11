@@ -1,4 +1,4 @@
-"""backrooms.py - a small raycast maze that does not try very hard."""
+
 
 import math
 import os
