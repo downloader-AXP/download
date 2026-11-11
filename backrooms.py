@@ -20,9 +20,11 @@ DAY_SECONDS = 120.0
 DAY_STEP = 40.0
 NIGHT_SECONDS = 30.0
 PLAYER_SPEED = 2.3
-BOT_SPEED = PLAYER_SPEED
+BOT_SPEED = 1.55
 TURN_SPEED = 2.2
-LIGHT_RANGE = 4.6
+LIGHT_RANGE = 3.2
+LIGHT_FALLOFF = 1.35
+FLASH_RANGE = 9.5
 SPRINT_TIME = 5.0
 SPRINT_COOLDOWN = 20.0
 SPRINT_MULT = 1.18
@@ -296,7 +298,7 @@ class Game:
     def light(self, distance):
         if self.phase != 1:
             return 1.0
-        return max(0.0, min(1.0, (1.0 - distance / LIGHT_RANGE) * 1.5))
+        return max(0.0, min(1.0, (1.0 - distance / LIGHT_RANGE) * LIGHT_FALLOFF))
 
     def make_step_sound(self):
         if not pygame.mixer.get_init():
@@ -514,7 +516,12 @@ class Game:
             line_h = int(H / perp)
             top = H // 2 - line_h // 2
             if self.phase == 1:
-                level = int(self.light(perp) * (WALL_LEVELS - 1) + 0.5)
+                brightness = self.light(perp)
+                if self.flashlight:
+                    cone = max(0.0, 1.0 - abs(camera) * 1.35)
+                    beam = max(0.0, 1.0 - perp / FLASH_RANGE) * cone
+                    brightness = min(1.0, max(brightness, beam))
+                level = int(brightness * (WALL_LEVELS - 1) + 0.5)
                 ladder = (
                     self.wall_blood_levels if self.final_night else self.wall_night_levels
                 )
@@ -555,11 +562,20 @@ class Game:
         arr[half] = floor_tex[ty[half], tx[half]]
         arr[half + 1:] = floor_tex[ty[half + 1:], tx[half + 1:]]
         if self.phase == 1:
-            fade = np.clip((1.0 - distance / LIGHT_RANGE) * 1.5, 0.0, 1.0)
+            fade = np.clip(
+                (1.0 - distance / LIGHT_RANGE) * LIGHT_FALLOFF, 0.0, 1.0
+            )[:, None]
+            if self.flashlight:
+                cone = np.clip(1.0 - np.abs(xs) * 1.35, 0.0, 1.0)
+                beam = (
+                    np.clip(1.0 - distance[:, None] / FLASH_RANGE, 0.0, 1.0)
+                    * cone[None, :]
+                )
+                fade = np.maximum(fade, beam)
             if self.final_night:
-                arr = (arr * (fade[:, None, None] * BLOOD_TINT)).astype(np.uint8)
+                arr = (arr * (fade[:, :, None] * BLOOD_TINT)).astype(np.uint8)
             else:
-                arr = (arr * fade[:, None, None]).astype(np.uint8)
+                arr = (arr * fade[:, :, None]).astype(np.uint8)
         pygame.surfarray.blit_array(self.frame, np.ascontiguousarray(arr.transpose(1, 0, 2)))
 
     def draw_bot(self, dirx, diry, planex, planey):
@@ -583,25 +599,30 @@ class Game:
         if size < 2 or size > H * 6:
             return
         img = pygame.transform.scale(self.bot_img, (size, size))
-        shade = int(max(self.light(ty), 0.7) * 255)
+        brightness = self.light(ty)
+        if self.flashlight:
+            cone = max(0.0, 1.0 - abs(tx / ty) * 1.35)
+            beam = max(0.0, 1.0 - ty / FLASH_RANGE) * cone
+            brightness = max(brightness, beam)
+        shade = int(max(brightness, 0.7) * 255)
         if shade < 255:
             img.fill((shade, shade, shade, 255), special_flags=pygame.BLEND_MULT)
 
         aura_size = min(int(size * 1.7), H * 6)
         if aura_size > 2:
             aura = pygame.transform.scale(self.aura_img, (aura_size, aura_size))
-            self.frame.blit(
-                aura, (screen_x - aura_size // 2, top + size // 2 - aura_size // 2)
-            )
+            aura_left = screen_x - aura_size // 2
+            aura_top = top + size // 2 - aura_size // 2
+            for x in range(max(0, aura_left), min(W, aura_left + aura_size)):
+                if self.zbuf[x] > ty:
+                    self.frame.blit(
+                        aura, (x, aura_top), (x - aura_left, 0, 1, aura_size)
+                    )
 
-        ghost = None
-        if not self.flashlight:
-            ghost = img.copy()
-            ghost.fill((255, 255, 255, 100), special_flags=pygame.BLEND_RGBA_MULT)
         left = screen_x - size // 2
         for x in range(max(0, left), min(W, left + size)):
-            source = img if self.flashlight or self.zbuf[x] > ty else ghost
-            self.frame.blit(source, (x, top), (x - left, 0, 1, size))
+            if self.zbuf[x] > ty:
+                self.frame.blit(img, (x, top), (x - left, 0, 1, size))
 
     def draw_timers(self):
         color = (235, 235, 225)
@@ -648,39 +669,51 @@ class Game:
         self.frame.blit(shadow, (x + 1, H - 13))
         self.frame.blit(text, (x, H - 14))
 
-    def draw_skill(self):
-        rect = pygame.Rect(W - 60, H - 34, 54, 28)
-        panel = pygame.Surface(rect.size, pygame.SRCALPHA)
-        panel.fill((8, 8, 10, 190))
-        self.frame.blit(panel, rect.topleft)
+    def draw_sprint_icon(self):
         if self.sprint_time > 0.0:
             color = (255, 200, 90)
-            status = "%.1fs" % self.sprint_time
             fill = self.sprint_time / SPRINT_TIME
         elif self.sprint_cd > 0.0:
-            color = (125, 128, 136)
-            status = "%ds" % math.ceil(self.sprint_cd)
+            color = (88, 91, 99)
             fill = 1.0 - self.sprint_cd / SPRINT_COOLDOWN
         else:
             color = (120, 235, 150)
-            status = "READY"
             fill = 1.0
-        pygame.draw.rect(self.frame, color, rect, 1)
-        label = self.font.render("SPRINT", True, (225, 225, 215))
-        self.frame.blit(label, (rect.x + 4, rect.y + 2))
-        text = self.font.render(status, True, color)
-        self.frame.blit(text, (rect.x + 4, rect.y + 13))
-        bar = pygame.Rect(rect.x + 4, rect.bottom - 5, int((rect.width - 8) * fill), 3)
-        if bar.width > 0:
-            pygame.draw.rect(self.frame, color, bar)
+        base_x = W - 26
+        base_y = H - 27
+        for i in range(3):
+            cx = base_x + i * 7
+            pygame.draw.rect(self.frame, color, (cx + 1, base_y + 7, 3, 6))
+            pygame.draw.polygon(
+                self.frame,
+                color,
+                [(cx, base_y + 8), (cx + 5, base_y + 8), (cx + 2, base_y + 2)],
+            )
+        bar = pygame.Rect(base_x, H - 9, 21, 2)
+        pygame.draw.rect(self.frame, (45, 47, 53), bar)
+        if fill > 0.0:
+            pygame.draw.rect(
+                self.frame, color, (bar.x, bar.y, int(bar.width * fill), bar.height)
+            )
 
-    def draw_flashlight(self):
-        label = "F LIGHT " + ("ON" if self.flashlight else "OFF")
-        color = (255, 232, 160) if self.flashlight else (120, 120, 126)
-        shadow = self.font.render(label, True, (0, 0, 0))
-        text = self.font.render(label, True, color)
-        self.frame.blit(shadow, (5, H - 13))
-        self.frame.blit(text, (4, H - 14))
+    def draw_flashlight_icon(self):
+        color = (255, 228, 140) if self.flashlight else (185, 187, 195)
+        pygame.draw.rect(self.frame, (0, 0, 0), (5, 10, 10, 6))
+        pygame.draw.polygon(
+            self.frame, (0, 0, 0), [(15, 7), (20, 5), (20, 17), (15, 15)]
+        )
+        pygame.draw.rect(self.frame, color, (4, 9, 10, 6))
+        pygame.draw.polygon(
+            self.frame, color, [(14, 6), (19, 4), (19, 16), (14, 14)]
+        )
+        lens = (255, 252, 220) if self.flashlight else (55, 57, 64)
+        pygame.draw.rect(self.frame, lens, (19, 6, 2, 10))
+        pygame.draw.rect(self.frame, (30, 30, 34), (6, 7, 3, 2))
+        if self.flashlight:
+            beam = (255, 240, 180)
+            pygame.draw.line(self.frame, beam, (22, 8), (27, 6))
+            pygame.draw.line(self.frame, beam, (22, 10), (28, 10))
+            pygame.draw.line(self.frame, beam, (22, 12), (27, 14))
 
     def play_rect(self):
         return pygame.Rect(W // 2 - 42, 92, 84, 24)
@@ -827,16 +860,15 @@ class Game:
                         planex = -diry * 0.66
                         planey = dirx * 0.66
                         self.paint_floor_ceiling(dirx, diry, planex, planey)
-                        if not self.flashlight:
-                            self.cast_walls(dirx, diry, planex, planey)
+                        self.cast_walls(dirx, diry, planex, planey)
                         self.draw_bot(dirx, diry, planex, planey)
                         if self.final_night:
                             self.frame.blit(self.blood_fog, (0, 0))
                         self.draw_timers()
                         self.draw_banner()
                         self.draw_meter()
-                        self.draw_skill()
-                        self.draw_flashlight()
+                        self.draw_sprint_icon()
+                        self.draw_flashlight_icon()
 
             pygame.transform.scale(self.frame, (W * SCALE, H * SCALE), self.screen)
             pygame.display.flip()
