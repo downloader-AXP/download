@@ -23,6 +23,8 @@ NIGHT_SECONDS = 30.0
 PLAYER_SPEED = 2.3
 TURN_SPEED = 2.2
 BOT_SPEED = 1.55
+LIGHT_RANGE = 4.6
+WALL_LEVELS = 24
 
 WALL = "png1.png"
 FLOOR_DAY = "png2.png"
@@ -206,7 +208,9 @@ class Game:
         self.font = pygame.font.SysFont("consolas", 11, bold=True)
 
         self.wall = load_texture(WALL, (150, 136, 84))
-        self.wall_night = self.tint(self.wall, (158, 162, 178))
+        self.wall_night_levels = self.shade_ladder(
+            self.tint(self.wall, (158, 162, 178))
+        )
         self.floor_day = load_texture(FLOOR_DAY, (120, 110, 78))
         self.floor_night = load_texture(FLOOR_NIGHT, (34, 30, 28))
         self.ceil_day = load_texture(CEIL_DAY, (150, 148, 138))
@@ -219,7 +223,6 @@ class Game:
         self.night_ceil_arr = self.tex_array(self.ceil_night)
 
         self.frame = pygame.Surface((W, H)).convert()
-        self.fog = self.make_fog()
 
         self.music_ready = False
         try:
@@ -253,6 +256,18 @@ class Game:
         copy.blit(shade, (0, 0), special_flags=pygame.BLEND_MULT)
         return copy
 
+    @classmethod
+    def shade_ladder(cls, surf, steps=WALL_LEVELS):
+        return [
+            cls.tint(surf, (v, v, v))
+            for v in (round(i * 255 / (steps - 1)) for i in range(steps))
+        ]
+
+    def light(self, distance):
+        if self.phase != 1:
+            return 1.0
+        return max(0.0, min(1.0, (1.0 - distance / LIGHT_RANGE) * 1.5))
+
     def make_step_sound(self):
         if not pygame.mixer.get_init():
             return None
@@ -278,18 +293,6 @@ class Game:
             )
         except Exception:
             return None
-
-    def make_fog(self):
-        yy, xx = np.mgrid[0:H, 0:W]
-        nx = (xx - W / 2.0) / (H / 2.0)
-        ny = (yy - H / 2.0) / (H / 2.0)
-        radius = np.sqrt(nx * nx + ny * ny)
-        edge = np.clip((radius - 0.26) / 0.72, 0.0, 1.0)
-        edge = edge * edge * (3.0 - 2.0 * edge)
-        alpha = (42.0 + 208.0 * edge).astype(np.uint8)
-        arr = np.zeros((H, W, 4), dtype=np.uint8)
-        arr[:, :, 3] = alpha
-        return pygame.image.frombuffer(arr.tobytes(), (W, H), "RGBA")
 
     def new_round(self):
         self.maze = make_maze()
@@ -413,7 +416,7 @@ class Game:
         if math.hypot(self.px - self.bot_x, self.py - self.bot_y) < 0.55:
             self.caught = 1.7
 
-    def cast_walls(self, dirx, diry, planex, planey, wall):
+    def cast_walls(self, dirx, diry, planex, planey):
         for x in range(W):
             camera = 2.0 * x / W - 1.0
             rdx = dirx + planex * camera
@@ -457,7 +460,11 @@ class Game:
             self.zbuf[x] = perp
             line_h = int(H / perp)
             top = H // 2 - line_h // 2
-            tex = wall
+            if self.phase == 1:
+                level = int(self.light(perp) * (WALL_LEVELS - 1) + 0.5)
+                tex = self.wall_night_levels[level]
+            else:
+                tex = self.wall
             if side == 0:
                 wall_x = self.py + perp * rdy
             else:
@@ -491,6 +498,9 @@ class Game:
         arr[:half] = ceil_tex[ty[:half], tx[:half]]
         arr[half] = floor_tex[ty[half], tx[half]]
         arr[half + 1:] = floor_tex[ty[half + 1:], tx[half + 1:]]
+        if self.phase == 1:
+            fade = np.clip((1.0 - distance / LIGHT_RANGE) * 1.5, 0.0, 1.0)
+            arr = (arr * fade[:, None, None]).astype(np.uint8)
         pygame.surfarray.blit_array(self.frame, np.ascontiguousarray(arr.transpose(1, 0, 2)))
 
     def draw_bot(self, dirx, diry, planex, planey):
@@ -514,13 +524,13 @@ class Game:
         if size < 2 or size > H * 6:
             return
         img = pygame.transform.scale(self.bot_img, (size, size))
+        shade = int(self.light(ty) * 255)
+        if shade < 255:
+            img.fill((shade, shade, shade, 255), special_flags=pygame.BLEND_MULT)
         left = screen_x - size // 2
         for x in range(max(0, left), min(W, left + size)):
             if self.zbuf[x] > ty:
                 self.frame.blit(img, (x, top), (x - left, 0, 1, size))
-
-    def draw_fog(self):
-        self.frame.blit(self.fog, (0, 0))
 
     def draw_timers(self):
         if self.phase == 0:
@@ -598,16 +608,8 @@ class Game:
                 planex = -diry * 0.66
                 planey = dirx * 0.66
                 self.paint_floor_ceiling(dirx, diry, planex, planey)
-                self.cast_walls(
-                    dirx,
-                    diry,
-                    planex,
-                    planey,
-                    self.wall_night if self.phase == 1 else self.wall,
-                )
+                self.cast_walls(dirx, diry, planex, planey)
                 self.draw_bot(dirx, diry, planex, planey)
-                if self.phase == 1:
-                    self.draw_fog()
                 self.draw_timers()
                 self.draw_meter()
 
