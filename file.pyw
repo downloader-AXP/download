@@ -184,6 +184,33 @@ def create_startup_task():
     ) == 0
 
 
+def tune_startup_task():
+
+    # The schtasks defaults skip the logon run on battery, stop the
+    # client when the charger is unplugged, and end it after 72 hours.
+    if os.name != "nt":
+        return False
+
+    script = (
+        "$ErrorActionPreference='Stop'; try { "
+        "$n='" + STARTUP_NAME + "'; "
+        "$s=(Get-ScheduledTask -TaskName $n).Settings; "
+        "$s.DisallowStartIfOnBatteries=$false; "
+        "$s.StopIfGoingOnBatteries=$false; "
+        "$s.ExecutionTimeLimit='PT0S'; "
+        "$s.StartWhenAvailable=$true; "
+        "Set-ScheduledTask -TaskName $n -Settings $s | Out-Null"
+        " } catch { exit 1 }"
+    )
+
+    return run_quiet(
+        [
+            "powershell", "-NoProfile", "-WindowStyle", "Hidden",
+            "-Command", script
+        ]
+    ) == 0
+
+
 def trigger_startup_task():
 
     if os.name != "nt":
@@ -202,6 +229,12 @@ def ensure_startup_entry():
     task_ready = is_admin() and (
         create_startup_task() or startup_task_exists()
     )
+
+    if task_ready and not tune_startup_task():
+        print(
+            "[STARTUP] Could not update the logon task conditions.",
+            flush=True
+        )
 
     try:
 
